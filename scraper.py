@@ -48,7 +48,9 @@ import os
 import re
 import sys
 import json
+import time
 import asyncio
+import requests
 import argparse
 import textwrap
 from pathlib import Path
@@ -94,6 +96,21 @@ def clean_count(raw: str | None) -> int:
 
 def normalise_whitespace(txt: str) -> str:
     return " ".join(txt.split())
+
+def variant_from_mp4(url: str) -> dict:
+    # Twitter’s path contains `/<width>x<height>/`
+    m = re.search(r'/(\d{2,4}x\d{2,4})/', url)
+    resolution = m.group(1) if m else None
+    # HEAD request to get size ⇒ rough bitrate estimate
+    size = int(requests.head(url, allow_redirects=True).headers.get('content-length', 0))
+    # assume ~8 Mbps per 1 MB/s of bytes/sec   (very rough)
+    bitrate = round(size / 128_000) * 1000 if size else None
+    variant = {
+        "bitrate": bitrate, 
+        "resolution": resolution,
+        "url": url,
+    }
+    return [variant]
 
 
 # ---------- core scraping ----------------------------------------------------
@@ -152,6 +169,13 @@ class ThreadScraper:
         author_handle = author_parts[1]                     # e.g. '/johnrushx/status/…' → 'johnrushx'
 
         for art in articles:
+            # ensure the tweet (and its video) is actually rendered
+            # try:
+            #     await art.scroll_into_view_if_needed()
+            #     await self.page.wait_for_load_state("networkidle", timeout=3_000)
+            # except pw.TimeoutError:
+            #     pass
+            
             # permalink → handle & tweet-ID
             permalink_el = await art.query_selector('a[href*="/status/"]')
             if not permalink_el:
@@ -175,7 +199,31 @@ class ThreadScraper:
 
             # text
             text_el = await art.query_selector('div[data-testid="tweetText"]')
-            raw_text = await text_el.inner_text() if text_el is not None else ""
+            if text_el:
+                raw_text = await text_el.evaluate("""
+                    (node) => {
+                        // Depth‑first walk that keeps both text nodes and emoji <img alt="…">
+                        const collect = (n) => {
+                            let out = '';
+                            n.childNodes.forEach(child => {
+                                if (child.nodeType === Node.TEXT_NODE) {
+                                    out += child.textContent;
+                                } else if (child.nodeType === Node.ELEMENT_NODE) {
+                                    if (child.tagName.toLowerCase() === 'img' && child.alt) {
+                                        out += child.alt;          // the actual emoji character
+                                    } else {
+                                        out += collect(child);     // recurse
+                                    }
+                                }
+                            });
+                            return out;
+                        };
+                        return collect(node);
+                    }
+                """)
+            else:
+                raw_text = ""
+
             text_content = normalise_whitespace(raw_text)
 
             # counts
@@ -188,16 +236,28 @@ class ThreadScraper:
             reply_el = await art.query_selector('div[data-testid="reply"] span')
             replies = clean_count(await reply_el.inner_text() if reply_el is not None else None)
 
-            # media
+            # ── media (images + all video variants) ───────────────────────────────
             images = [
                 await img.get_attribute("src")
                 for img in await art.query_selector_all('img[src*="twimg.com/media"]')
             ]
-            videos = [
-                await vid.get_attribute("src")
-                for vid in await art.query_selector_all("video")
-            ]
-            
+
+            video_variants: list[dict] = []
+
+            for vtag in await art.query_selector_all("div[data-testid='videoPlayer'] video, video"):
+                src = await vtag.get_attribute("src") or \
+                    (await (await vtag.query_selector("source[src]")).get_attribute("src"))
+                print(src)
+                if src and "twimg.com" in src:
+                    video_variants.extend(variant_from_mp4(src))   # ✅ extend with list
+
+            media_obj = {}
+            if images:
+                media_obj["images"] = images
+            if video_variants:
+                media_obj["type"] = "video"
+                media_obj["variants"] = video_variants
+                    
             # ── display name (handle rare NULL) ───────────────────────────────
             disp_el = await art.query_selector("div[data-testid='User-Name'] span") \
                       or await art.query_selector("div[dir='auto'] span")
@@ -213,10 +273,7 @@ class ThreadScraper:
                     "likes": likes,
                     "retweets": retweets,
                     "replies": replies,
-                    "media": {
-                        "images": images,
-                        "videos": videos,
-                    },
+                    "media": media_obj,
                 }
             )
 
@@ -230,7 +287,7 @@ class ThreadScraper:
         # Sometimes X lazy‑loads tweets → wait until at least 1 article is present
         await self.page.wait_for_selector(TWEET_ARTICLE, timeout=30_000)
 
-        await self._load_entire_thread()
+        # await self._load_entire_thread()
         tweets = await self._extract_tweets()
 
         return {
@@ -293,18 +350,6 @@ async def main(argv: List[str] | None = None) -> None:
     if twid:
         cookies.append({"name": "twid", "value": twid, "domain": ".x.com", "path": "/", "secure": True})
     await context.add_cookies(cookies)
-    # await context.add_cookies(
-    #     [
-    #         {
-    #             "name": "auth_token",
-    #             "value": auth_token,
-    #             "domain": "x.com",
-    #             "path": "/",
-    #             "httpOnly": True,
-    #             "secure": True,
-    #         }
-    #     ]
-    # )
 
     page = await context.new_page()
     scraper = ThreadScraper(page, proxy=args.proxy)
