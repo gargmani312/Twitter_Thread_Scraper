@@ -48,11 +48,11 @@ import os
 import re
 import sys
 import json
-import time
 import asyncio
 import requests
 import argparse
 import textwrap
+import traceback
 from pathlib import Path
 from dotenv import load_dotenv
 from rich.console import Console
@@ -75,6 +75,9 @@ AUTHOR_RE = re.compile(r"^/@?([\w\d_]+)$")
 X_AUTH_TOKEN = os.getenv("X_AUTH_TOKEN")
 X_CT0 = os.getenv("X_CT0")
 X_TWID = os.getenv("X_TWID")
+HEADLESS = True
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
 
 
 # ---------- data helpers -----------------------------------------------------
@@ -157,41 +160,30 @@ class ThreadScraper:
     
     
     async def _click_show_replies(self) -> bool:
-        """
-        Click every visible 'Show replies' / 'Show more replies' button.
-        Returns True if we clicked at least one (i.e., new content should load).
-        """
-        clicked_any = False
-        # Playwright's :has-text() works on locators, not query_selector_all
-        loc = self.page.locator(
+        """Click the first 'Show replies' / 'Show more replies' button (if any) and return."""
+        btn = self.page.locator(
             "button:has-text('Show replies'), button:has-text('Show more replies')"
-        )
-        # Loop because new buttons can appear after clicking the first batch
-        while True:
-            count = await loc.count()
-            if count == 0:
-                break
-            for i in range(count):
-                btn = loc.nth(i)
-                try:
-                    await btn.scroll_into_view_if_needed()
-                except Exception:
-                    pass
-                try:
-                    await btn.click(timeout=2000)
-                    clicked_any = True
-                    await self.page.wait_for_timeout(400)
-                except Exception:
-                    continue
-        if clicked_any:
-            # Give network a moment to fetch the newly exposed tweets
-            try:
-                await self.page.wait_for_load_state("networkidle", timeout=2000)
-            except pw.TimeoutError:
-                pass
-            await self.page.wait_for_timeout(250)
+        ).first
+        if await btn.count() == 0:
+            return False
 
-        return clicked_any
+        try:
+            await btn.scroll_into_view_if_needed()
+        except Exception:
+            pass
+
+        try:
+            await btn.click(timeout=2000)
+        except Exception:
+            return False
+
+        # brief pause so newly revealed tweets mount
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=2000)
+        except pw.TimeoutError:
+            pass
+        await self.page.wait_for_timeout(250)
+        return True
 
 
     async def _scroll_into_view(self, art) -> None:
@@ -376,7 +368,10 @@ class ThreadScraper:
         await self.page.goto(url, wait_until="domcontentloaded", timeout=60_000)
 
         # Sometimes X lazy‑loads tweets → wait until at least 1 article is present
-        await self.page.wait_for_selector(TWEET_ARTICLE, timeout=30_000)
+        await self.page.wait_for_selector(TWEET_ARTICLE, state="attached", timeout=30_000)
+        await self.page.wait_for_load_state("domcontentloaded")
+        await self.page.wait_for_timeout(800)           # let initial JS run
+        await self.page.mouse.wheel(0, 600)             # nudge to trigger first batch render
 
         # await self._load_entire_thread()
         tweets = await self._extract_tweets()
@@ -398,6 +393,7 @@ class ThreadScraper:
         TAIL_LIMIT = 1           # N non-author tweets in a row after we've started → stop
         stall_count = 0
         after_thread_tail = 0
+        tweet_counter = 0
 
         while True:
             articles = await self.page.query_selector_all(TWEET_ARTICLE)
@@ -411,10 +407,10 @@ class ThreadScraper:
 
             # expand collapsed tail sections
             if await self._click_show_replies():
-               # new tweets likely appeared; re-loop to pick them up
-               stall_count = 0
-               continue
-
+                # new tweets likely appeared; re-loop to pick them up
+                stall_count = 0
+                continue
+            
             # determine author once
             if author_handle is None:
                 first_permalink = await articles[0].query_selector('a[href*="/status/"]')
@@ -460,7 +456,10 @@ class ThreadScraper:
                     tweets.append(tweet_obj)
                     seen_ids.add(tweet_id)
                     new_this_pass += 1
-
+                    tweet_counter += 1
+                    tweet_txt = f"{tweet_obj['text'][:50]}..." if len(tweet_obj['text']) >= 50 else f"{tweet_obj['text']}"
+                    print(f"Collected tweet #{tweet_counter}: {tweet_id} by {author_handle}: {tweet_txt}")
+                
             # scroll for more (incremental, avoid skipping)
             if new_this_pass == 0:
                 stall_count += 1
@@ -518,9 +517,29 @@ async def main(argv: List[str] | None = None) -> None:
         sys.exit(1)
 
     playwright = await pw.async_playwright().start()
-    browser = await playwright.chromium.launch(headless=False, proxy={"server": args.proxy} if args.proxy else None)
+    browser = await playwright.chromium.launch(
+        headless=HEADLESS,
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage",
+            "--no-sandbox",
+        ],
+        proxy={"server": args.proxy} if args.proxy else None
+    )
 
-    context = await browser.new_context()
+    context = await browser.new_context(
+        user_agent=UA,
+        viewport={"width": 1366, "height": 900},
+        device_scale_factor=1,
+        locale="en-US",
+        timezone_id="Asia/Kolkata",
+    )
+
+    # stealth: kill webdriver flag
+    await context.add_init_script(
+        "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+    )
+
     # inject cookie
     cookies = [
         {"name": "auth_token", "value": X_AUTH_TOKEN, "domain": ".x.com", "path": "/", "httpOnly": True, "secure": True},
@@ -542,7 +561,7 @@ async def main(argv: List[str] | None = None) -> None:
             res = await scraper.scrape(url)
             results.append(res)
         except Exception as e:
-            print("Error scraping", url, " :: ", e)
+            print("Error scraping", url, " :: ", traceback.format_exc())
 
     await browser.close()
     await playwright.stop()
