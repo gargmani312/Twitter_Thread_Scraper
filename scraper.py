@@ -123,222 +123,252 @@ class ThreadScraper:
         self,
         page: pw.Page,
         proxy: Optional[str] = None,
-        max_scrolls: int = 20,
         scroll_pause: float = 0.6,
     ) -> None:
         self.page = page
-        self.max_scrolls = max_scrolls
         self.scroll_pause = scroll_pause
         self.proxy = proxy
 
 
-    async def _load_entire_thread(self) -> None:
-        """Scrolls the page down until no new tweets appear or max_scrolls reached."""
-        last_height = await self.page.evaluate("document.body.scrollHeight")
-        for _ in range(self.max_scrolls):
-            await self.page.mouse.wheel(0, 10_000)
-            await self.page.wait_for_timeout(self.scroll_pause * 1000)
-            new_height = await self.page.evaluate("document.body.scrollHeight")
-            if new_height == last_height:
+    # ───────────── Tweet extraction helper methods ─────────────
+    
+    async def _scroll_until_new(self, seen_ids: set[str], step: int = 1400, max_steps: int = 15) -> bool:
+        """Smoothly scroll down in small steps until at least one unseen tweet appears,
+        or we hit max_steps. Returns True if new tweets appeared."""
+        for _ in range(max_steps):
+            before = len(seen_ids)
+            await self.page.mouse.wheel(0, step)
+            await self.page.wait_for_timeout(180)
+            try:
+                await self.page.wait_for_load_state("networkidle", timeout=1200)
+            except pw.TimeoutError:
+                pass
+            # quick check for any new article ids
+            arts = await self.page.query_selector_all(TWEET_ARTICLE)
+            for a in arts:
+                pl = await a.query_selector('a[href*="/status/"]')
+                if not pl:
+                    continue
+                href = await pl.get_attribute("href") or ""
+                m = TWEET_URL_RE.search(href)
+                if m and m.group(1) not in seen_ids:
+                    return True
+        return False
+    
+    
+    async def _click_show_replies(self) -> bool:
+        """
+        Click every visible 'Show replies' / 'Show more replies' button.
+        Returns True if we clicked at least one (i.e., new content should load).
+        """
+        clicked_any = False
+        # Playwright's :has-text() works on locators, not query_selector_all
+        loc = self.page.locator(
+            "button:has-text('Show replies'), button:has-text('Show more replies')"
+        )
+        # Loop because new buttons can appear after clicking the first batch
+        while True:
+            count = await loc.count()
+            if count == 0:
                 break
-            last_height = new_height
+            for i in range(count):
+                btn = loc.nth(i)
+                try:
+                    await btn.scroll_into_view_if_needed()
+                except Exception:
+                    pass
+                try:
+                    await btn.click(timeout=2000)
+                    clicked_any = True
+                    await self.page.wait_for_timeout(400)
+                except Exception:
+                    continue
+        if clicked_any:
+            # Give network a moment to fetch the newly exposed tweets
+            try:
+                await self.page.wait_for_load_state("networkidle", timeout=2000)
+            except pw.TimeoutError:
+                pass
+            await self.page.wait_for_timeout(250)
 
-        # ── finished loading: go back to the very top ────────────────────────
-        await self.page.evaluate("window.scrollTo(0, 0)")
-        await self.page.wait_for_timeout(3000)  # tiny pause so first tweets are visible
+        return clicked_any
 
 
-    async def _extract_tweets(self) -> List[Dict[str, Any]]:
-        """Return all tweets belonging to the original author in the current DOM."""
-        tweets: List[Dict[str, Any]] = []
-        articles = await self.page.query_selector_all(TWEET_ARTICLE)
-        if not articles:
-            console.log("[bold red]No tweets found – page layout might have changed.")
-            return tweets
+    async def _scroll_into_view(self, art) -> None:
+        """Smoothly bring a tweet into view so X materializes its lazy DOM."""
+        await self.page.evaluate(
+            "(el)=>el && el.scrollIntoView({behavior:'smooth', block:'center'})",
+            art,
+        )
+        # small wheel ticks to mimic human scroll & trigger virtualization
+        for _ in range(2):
+            await self.page.mouse.wheel(0, 320)
+            await self.page.wait_for_timeout(50)
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=2000)
+        except pw.TimeoutError:
+            pass
+        await self.page.wait_for_timeout(150)
 
-        # ── work out the author handle from the first tweet permalink ──────────────
-        first_permalink = await articles[0].query_selector('a[href*="/status/"]')
-        if not first_permalink:
-            console.log("[bold red]Could not find a tweet permalink – layout change?")
-            return tweets
-        first_href = (await first_permalink.get_attribute("href") or "").strip("/")
-        author_parts = first_href.split("/")
-        if len(author_parts) < 2:
-            console.log("[bold red]Could not determine author handle.")
-            return tweets
-        author_handle = author_parts[1]
-
-        for art in articles:
-            # ensure the tweet (and its video) is actually rendered
-            # try:
-            #     await art.scroll_into_view_if_needed()
-            #     await self.page.wait_for_load_state("networkidle", timeout=3_000)
-            # except pw.TimeoutError:
-            #     pass
-            
-            # permalink → handle & tweet-ID
-            permalink_el = await art.query_selector('a[href*="/status/"]')
-            if not permalink_el:
-                continue
-            tweet_url = await permalink_el.get_attribute("href") or ""
-            path_parts = tweet_url.strip("/").split("/")
-            if len(path_parts) < 2:
-                continue
-            handle = path_parts[1]
-            if handle != author_handle:                     # skip retweets / others
-                continue
-
-            tid_match = TWEET_URL_RE.search(tweet_url)
-            if not tid_match:
-                continue
-            tweet_id = tid_match.group(1)
-
-            # timestamp
-            time_el = await art.query_selector("time")
-            date_time_iso = await time_el.get_attribute("datetime") if time_el else None
-
-            # text
-            text_el = await art.query_selector('div[data-testid="tweetText"]')
-            if text_el:
-                raw_text = await text_el.evaluate("""
-                    (node) => {
-                        // Depth‑first walk that keeps both text nodes and emoji <img alt="…">
-                        const collect = (n) => {
-                            let out = '';
-                            n.childNodes.forEach(child => {
-                                if (child.nodeType === Node.TEXT_NODE) {
-                                    out += child.textContent;
-                                } else if (child.nodeType === Node.ELEMENT_NODE) {
-                                    if (child.tagName.toLowerCase() === 'img' && child.alt) {
-                                        out += child.alt;          // the actual emoji character
-                                    } else {
-                                        out += collect(child);     // recurse
-                                    }
-                                }
-                            });
-                            return out;
-                        };
-                        return collect(node);
-                    }
-                """)
-            else:
-                raw_text = ""
-
-            text_content = normalise_whitespace(raw_text)
-
-            # ── counts + views (keep original string, no normalization) ────────
-            async def _raw_count(testid: str) -> str:
-                # 1) animated counter span
-                el = await art.query_selector(
-                    f"[data-testid='{testid}'] [data-testid='app-text-transition-container'] span"
-                )
-                if el:
-                    return (await el.inner_text()).strip()
-
-                # 2) any plain span under that button/div
-                el = await art.query_selector(f"[data-testid='{testid}'] span")
-                if el:
-                    return (await el.inner_text()).strip()
-
-                # 3) aria-label fallback: e.g. "56 Likes. Like"
-                btn = await art.query_selector(f"[data-testid='{testid}'][aria-label]")
-                if btn:
-                    label = (await btn.get_attribute("aria-label")) or ""
-                    m = re.search(r"([0-9][0-9.,]*[KM]?)", label, re.I)
-                    if m:
-                        return m.group(1).strip()
-                return ""
-
-            async def _raw_views() -> str:
-                # 1) analytics link pattern
-                el = await art.query_selector(
-                    "a[href*='/analytics'] [data-testid='app-text-transition-container'] span"
-                )
-                if el:
-                    return (await el.inner_text()).strip()
-
-                link = await art.query_selector("a[href*='/analytics'][aria-label]")
-                if link:
-                    label = (await link.get_attribute("aria-label")) or ""
-                    m = re.search(r"([0-9][0-9.,]*[KM]?)\\s+views", label, re.I)
-                    if m:
-                        return m.group(1).strip()
-
-                # 2) dedicated container (rare)
-                el = await art.query_selector("div[data-testid='viewCount'] span")
-                if el:
-                    return (await el.inner_text()).strip()
-
-                # 3) Fallback: find literal 'Views' label and grab previous numeric span
-                raw = await art.evaluate("""
-                    (node) => {
-                        const spans = node.querySelectorAll('span');
-                        for (const s of spans) {
-                            if (/^\\s*views\\s*$/i.test(s.textContent)) {
-                                let p = s.previousElementSibling;
-                                while (p) {
-                                    const txt = (p.textContent || '').trim();
-                                    const m = txt.match(/[0-9][0-9.,]*[KM]?/i);
-                                    if (m) return m[0];
-                                    p = p.previousElementSibling;
-                                }
-                            }
+    async def _text_with_emojis(self, text_el) -> str:
+        if not text_el:
+            return ""
+        raw = await text_el.evaluate("""
+            (node) => {
+                const collect = (n) => {
+                    let out = '';
+                    n.childNodes.forEach(ch => {
+                        if (ch.nodeType === Node.TEXT_NODE) out += ch.textContent;
+                        else if (ch.nodeType === Node.ELEMENT_NODE) {
+                            if (ch.tagName.toLowerCase() === 'img' && ch.alt) out += ch.alt;
+                            else out += collect(ch);
                         }
-                        return null;
+                    });
+                    return out;
+                };
+                return collect(node);
+            }
+        """)
+        return normalise_whitespace(raw)
+
+
+    async def _raw_count(self, art, testid: str) -> str:
+        el = await art.query_selector(
+            f"[data-testid='{testid}'] [data-testid='app-text-transition-container'] span"
+        )
+        if el:
+            return (await el.inner_text()).strip()
+        el = await art.query_selector(f"[data-testid='{testid}'] span")
+        if el:
+            return (await el.inner_text()).strip()
+        btn = await art.query_selector(f"[data-testid='{testid}'][aria-label]")
+        if btn:
+            label = (await btn.get_attribute('aria-label')) or ""
+            m = re.search(r"([0-9][0-9.,]*[KM]?)", label, re.I)
+            if m:
+                return m.group(1).strip()
+        return ""
+
+
+    async def _raw_views(self, art) -> str:
+        el = await art.query_selector(
+            "a[href*='/analytics'] [data-testid='app-text-transition-container'] span"
+        )
+        if el:
+            return (await el.inner_text()).strip()
+
+        link = await art.query_selector("a[href*='/analytics'][aria-label]")
+        if link:
+            label = (await link.get_attribute("aria-label")) or ""
+            m = re.search(r"([0-9][0-9.,]*[KM]?)\\s+views", label, re.I)
+            if m:
+                return m.group(1).strip()
+
+        el = await art.query_selector("div[data-testid='viewCount'] span")
+        if el:
+            return (await el.inner_text()).strip()
+
+        raw = await art.evaluate("""
+            (node) => {
+                const spans = node.querySelectorAll('span');
+                for (const s of spans) {
+                    if (/^\\s*views\\s*$/i.test(s.textContent)) {
+                        let p = s.previousElementSibling;
+                        while (p) {
+                            const txt = (p.textContent || '').trim();
+                            const m = txt.match(/[0-9][0-9.,]*[KM]?/i);
+                            if (m) return m[0];
+                            p = p.previousElementSibling;
+                        }
                     }
-                """)
-                if raw:
-                    return raw.strip()
-
-                return ""
-
-            likes, retweets, replies, views = await asyncio.gather(
-                _raw_count("like"), _raw_count("retweet"), _raw_count("reply"), _raw_views()
-            )
-
-            # ── media (images + all video variants) ───────────────────────────────
-            images = [
-                await img.get_attribute("src")
-                for img in await art.query_selector_all('img[src*="twimg.com/media"]')
-            ]
-
-            video_variants: list[dict] = []
-
-            for vtag in await art.query_selector_all("div[data-testid='videoPlayer'] video, video"):
-                src = await vtag.get_attribute("src") or \
-                    (await (await vtag.query_selector("source[src]")).get_attribute("src"))
-                print(src)
-                if src and "twimg.com" in src:
-                    video_variants.extend(variant_from_mp4(src))   # ✅ extend with list
-
-            media_obj = {}
-            if images:
-                media_obj["images"] = images
-            if video_variants:
-                media_obj["type"] = "video"
-                media_obj["variants"] = video_variants
-                    
-            # ── display name (handle rare NULL) ───────────────────────────────
-            disp_el = await art.query_selector("div[data-testid='User-Name'] span") \
-                      or await art.query_selector("div[dir='auto'] span")
-            display_name = await disp_el.inner_text() if disp_el else ""
-
-            tweets.append(
-                {
-                    "tweet_id": tweet_id,
-                    "datetime": date_time_iso,
-                    "username": author_handle,
-                    "display_name": display_name,
-                    "text": text_content,
-                    "views": views,
-                    "likes": likes,
-                    "replies": replies,
-                    "retweets": retweets,
-                    "media": media_obj,
                 }
-            )
+                return null;
+            }
+        """)
+        if raw:
+            return raw.strip()
+        return ""
 
-        return tweets
+
+    async def _media(self, art) -> Dict[str, Any]:
+        images = [
+            await img.get_attribute("src")
+            for img in await art.query_selector_all('img[src*="twimg.com/media"]')
+        ]
+
+        videos_raw: List[str] = []
+        for vtag in await art.query_selector_all("div[data-testid='videoPlayer'] video, video"):
+            src = await vtag.get_attribute("src")
+            if not src:
+                src_el = await vtag.query_selector("source[src]")
+                if src_el:
+                    src = await src_el.get_attribute("src")
+            if src and "twimg.com" in src:
+                videos_raw.append(src)
+
+        video_variants: List[Dict[str, Any]] = []
+        for url in videos_raw:
+            video_variants.extend(variant_from_mp4(url))  # your existing helper
+
+        media_obj: Dict[str, Any] = {}
+        if images:
+            media_obj["images"] = images
+        if video_variants:
+            media_obj["type"] = "video"
+            media_obj["variants"] = video_variants
+        return media_obj
+
+
+    async def _parse_tweet(self, art, author_handle: str) -> Optional[Dict[str, Any]]:
+        """Return tweet dict if this article belongs to the author, else None."""
+        permalink_el = await art.query_selector('a[href*="/status/"]')
+        if not permalink_el:
+            return None
+        tweet_url = await permalink_el.get_attribute("href") or ""
+        tid_match = TWEET_URL_RE.search(tweet_url)
+        if not tid_match:
+            return None
+        tweet_id = tid_match.group(1)
+
+        handle = tweet_url.strip("/").split("/")[0]
+        if handle != author_handle:
+            return None
+
+        # timestamp
+        time_el = await art.query_selector("time")
+        date_time_iso = await time_el.get_attribute("datetime") if time_el else None
+
+        # text
+        text_el = await art.query_selector('div[data-testid="tweetText"]')
+        text_content = await self._text_with_emojis(text_el)
+
+        # counts
+        likes, retweets, replies, views = await asyncio.gather(
+            self._raw_count(art, "like"),
+            self._raw_count(art, "retweet"),
+            self._raw_count(art, "reply"),
+            self._raw_views(art),
+        )
+
+        # display name
+        disp_el = await art.query_selector("div[data-testid='User-Name'] span") \
+                  or await art.query_selector("div[dir='auto'] span")
+        display_name = await disp_el.inner_text() if disp_el else ""
+
+        media_obj = await self._media(art)
+
+        return {
+            "tweet_id": tweet_id,
+            "datetime": date_time_iso,
+            "username": author_handle,
+            "display_name": display_name,
+            "text": text_content,
+            "likes": likes,
+            "retweets": retweets,
+            "replies": replies,
+            "views": views,
+            "media": media_obj,
+        }
 
 
     async def scrape(self, url: str) -> Dict[str, Any]:
@@ -358,8 +388,99 @@ class ThreadScraper:
         }
 
 
-# ---------- CLI helpers ------------------------------------------------------
+    async def _extract_tweets(self) -> List[Dict[str, Any]]:
+        """Scroll-scrape the whole thread, grabbing every tweet by the author only."""
+        tweets: List[Dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        author_handle: Optional[str] = None
 
+        STALL_LIMIT = 3          # no new tweets found N times → stop
+        TAIL_LIMIT = 1           # N non-author tweets in a row after we've started → stop
+        stall_count = 0
+        after_thread_tail = 0
+
+        while True:
+            articles = await self.page.query_selector_all(TWEET_ARTICLE)
+            if not articles:
+                await self.page.mouse.wheel(0, 9000)
+                await self.page.wait_for_timeout(400)
+                stall_count += 1
+                if stall_count >= STALL_LIMIT:
+                    break
+                continue
+
+            # expand collapsed tail sections
+            if await self._click_show_replies():
+               # new tweets likely appeared; re-loop to pick them up
+               stall_count = 0
+               continue
+
+            # determine author once
+            if author_handle is None:
+                first_permalink = await articles[0].query_selector('a[href*="/status/"]')
+                if not first_permalink:
+                    console.log("[bold red]Could not find a tweet permalink – layout change?")
+                    return tweets
+                first_href = (await first_permalink.get_attribute("href") or "").strip("/")
+                parts = first_href.split("/")
+                if len(parts) < 2:
+                    console.log("[bold red]Could not determine author handle.")
+                    return tweets
+                author_handle = parts[0]
+                print(f"Author handle: {author_handle}")
+
+            new_this_pass = 0
+            for art in articles:
+                await self._scroll_into_view(art)
+
+                # get tweet id quickly to skip duplicates / decide author streak
+                permalink_el = await art.query_selector('a[href*="/status/"]')
+                if not permalink_el:
+                    continue
+                tweet_url = await permalink_el.get_attribute("href") or ""
+                tid_match = TWEET_URL_RE.search(tweet_url)
+                if not tid_match:
+                    continue
+                tweet_id = tid_match.group(1)
+                if tweet_id in seen_ids:
+                    continue
+
+                handle = tweet_url.strip("/").split("/")[0]
+                if handle != author_handle:
+                    after_thread_tail += 1
+                    if tweets and after_thread_tail >= TAIL_LIMIT:
+                        # we already collected author tweets and now saw enough non-author ones
+                        return tweets
+                    continue
+                else:
+                    after_thread_tail = 0
+
+                tweet_obj = await self._parse_tweet(art, author_handle)
+                if tweet_obj:
+                    tweets.append(tweet_obj)
+                    seen_ids.add(tweet_id)
+                    new_this_pass += 1
+
+            # scroll for more (incremental, avoid skipping)
+            if new_this_pass == 0:
+                stall_count += 1
+            else:
+                stall_count = 0
+            if stall_count >= STALL_LIMIT:
+                break
+
+            got_new = await self._scroll_until_new(seen_ids)
+            if not got_new:
+                stall_count += 1
+                if stall_count >= STALL_LIMIT:
+                    break
+
+        # optional reset
+        await self.page.wait_for_timeout(500)
+        return tweets
+
+
+# ---------- CLI helpers ------------------------------------------------------
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -415,17 +536,13 @@ async def main(argv: List[str] | None = None) -> None:
 
     results: List[Dict[str, Any]] = []
 
-    with Progress(transient=True) as progress:
-        task = progress.add_task("Scraping threads…", total=len(args.urls))
-        for i, url in enumerate(args.urls, 1):
-            try:
-                res = await scraper.scrape(url)
-                results.append(res)
-                progress.console.print(f"[green]✔[/green] Thread [{i}/{len(args.urls)}] scraped ({res['tweet_count']} tweets).")
-            except Exception as e:
-                progress.console.print(f"[bold red]✘[/bold red] Failed to scrape {url}: {e}")
-            finally:
-                progress.update(task, advance=1)
+    for i, url in enumerate(args.urls, 1):
+        try:
+            print(f"[{i}/{len(args.urls)}] Scraping {url}…")
+            res = await scraper.scrape(url)
+            results.append(res)
+        except Exception as e:
+            print("Error scraping", url, " :: ", e)
 
     await browser.close()
     await playwright.stop()
