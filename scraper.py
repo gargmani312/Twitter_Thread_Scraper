@@ -166,7 +166,7 @@ class ThreadScraper:
         if len(author_parts) < 2:
             console.log("[bold red]Could not determine author handle.")
             return tweets
-        author_handle = author_parts[1]                     # e.g. '/johnrushx/status/…' → 'johnrushx'
+        author_handle = author_parts[1]
 
         for art in articles:
             # ensure the tweet (and its video) is actually rendered
@@ -226,15 +226,75 @@ class ThreadScraper:
 
             text_content = normalise_whitespace(raw_text)
 
-            # counts
-            like_el = await art.query_selector('div[data-testid="like"] span')
-            likes = clean_count(await like_el.inner_text() if like_el is not None else None)
+            # ── counts + views (keep original string, no normalization) ────────
+            async def _raw_count(testid: str) -> str:
+                # 1) animated counter span
+                el = await art.query_selector(
+                    f"[data-testid='{testid}'] [data-testid='app-text-transition-container'] span"
+                )
+                if el:
+                    return (await el.inner_text()).strip()
 
-            rt_el = await art.query_selector('div[data-testid="retweet"] span')
-            retweets = clean_count(await rt_el.inner_text() if rt_el is not None else None)
+                # 2) any plain span under that button/div
+                el = await art.query_selector(f"[data-testid='{testid}'] span")
+                if el:
+                    return (await el.inner_text()).strip()
 
-            reply_el = await art.query_selector('div[data-testid="reply"] span')
-            replies = clean_count(await reply_el.inner_text() if reply_el is not None else None)
+                # 3) aria-label fallback: e.g. "56 Likes. Like"
+                btn = await art.query_selector(f"[data-testid='{testid}'][aria-label]")
+                if btn:
+                    label = (await btn.get_attribute("aria-label")) or ""
+                    m = re.search(r"([0-9][0-9.,]*[KM]?)", label, re.I)
+                    if m:
+                        return m.group(1).strip()
+                return ""
+
+            async def _raw_views() -> str:
+                # 1) analytics link pattern
+                el = await art.query_selector(
+                    "a[href*='/analytics'] [data-testid='app-text-transition-container'] span"
+                )
+                if el:
+                    return (await el.inner_text()).strip()
+
+                link = await art.query_selector("a[href*='/analytics'][aria-label]")
+                if link:
+                    label = (await link.get_attribute("aria-label")) or ""
+                    m = re.search(r"([0-9][0-9.,]*[KM]?)\\s+views", label, re.I)
+                    if m:
+                        return m.group(1).strip()
+
+                # 2) dedicated container (rare)
+                el = await art.query_selector("div[data-testid='viewCount'] span")
+                if el:
+                    return (await el.inner_text()).strip()
+
+                # 3) Fallback: find literal 'Views' label and grab previous numeric span
+                raw = await art.evaluate("""
+                    (node) => {
+                        const spans = node.querySelectorAll('span');
+                        for (const s of spans) {
+                            if (/^\\s*views\\s*$/i.test(s.textContent)) {
+                                let p = s.previousElementSibling;
+                                while (p) {
+                                    const txt = (p.textContent || '').trim();
+                                    const m = txt.match(/[0-9][0-9.,]*[KM]?/i);
+                                    if (m) return m[0];
+                                    p = p.previousElementSibling;
+                                }
+                            }
+                        }
+                        return null;
+                    }
+                """)
+                if raw:
+                    return raw.strip()
+
+                return ""
+
+            likes, retweets, replies, views = await asyncio.gather(
+                _raw_count("like"), _raw_count("retweet"), _raw_count("reply"), _raw_views()
+            )
 
             # ── media (images + all video variants) ───────────────────────────────
             images = [
@@ -270,9 +330,10 @@ class ThreadScraper:
                     "username": author_handle,
                     "display_name": display_name,
                     "text": text_content,
+                    "views": views,
                     "likes": likes,
-                    "retweets": retweets,
                     "replies": replies,
+                    "retweets": retweets,
                     "media": media_obj,
                 }
             )
@@ -330,10 +391,8 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
 
 async def main(argv: List[str] | None = None) -> None:
     args = parse_args(argv or sys.argv[1:])
-    # auth_token = os.getenv("X_AUTH_TOKEN")
-    auth_token = X_AUTH_TOKEN
 
-    if not auth_token:
+    if not X_AUTH_TOKEN:
         console.print("[bold red]❌  Please export the `X_AUTH_TOKEN` cookie from a logged‑in session.")
         sys.exit(1)
 
