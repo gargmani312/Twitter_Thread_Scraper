@@ -56,13 +56,12 @@ import traceback
 from pathlib import Path
 from dotenv import load_dotenv
 from rich.console import Console
-from rich.progress import Progress
 import playwright.async_api as pw
+from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
 load_dotenv()
 console = Console()
-
 
 # TWEET_ARTICLE = 'article[data-testid="tweet"]'        # even tighter match
 # # or, as a fallback if they drop <article>:
@@ -75,7 +74,7 @@ AUTHOR_RE = re.compile(r"^/@?([\w\d_]+)$")
 X_AUTH_TOKEN = os.getenv("X_AUTH_TOKEN")
 X_CT0 = os.getenv("X_CT0")
 X_TWID = os.getenv("X_TWID")
-HEADLESS = True
+HEADLESS = False
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
 
@@ -129,11 +128,54 @@ class ThreadScraper:
         scroll_pause: float = 0.6,
     ) -> None:
         self.page = page
+        self.author_name = None
+        self.author_handle = None
+        self.author_avatar_url = None
         self.scroll_pause = scroll_pause
         self.proxy = proxy
+        self.video_pool: dict[str, list[str]] = defaultdict(list)   # tweetVideoId -> [urls]
+        self.video_pool: dict[str, list[str]] = defaultdict(list)   # video_id -> [urls]
+        self.assigned_video_ids: set[str] = set()                   # avoid double-assign
+        self.page.context.on("response", self._capture_video)
 
 
     # ───────────── Tweet extraction helper methods ─────────────
+    async def _video_ids_in_art(self, art) -> list[str]:
+        """Find amplify/ext video ids inside this tweet article (poster/img/style attrs)."""
+        js = r"""
+        el => {
+          const rx = /(amplify_video|ext_tw_video)[/_](thumb\/)?(\d+)\//g;
+          const ids = new Set();
+          const push = v => { if (typeof v === 'string') {
+              let m; while ((m = rx.exec(v)) !== null) ids.add(m[3]);
+          }};
+          el.querySelectorAll('*').forEach(n => {
+            // attributes
+            for (const a of (n.attributes || [])) push(a.value);
+            // style background-image etc
+            const cs = n.style && n.style.cssText;
+            if (cs) push(cs);
+          });
+          return [...ids];
+        }
+        """
+        return await art.evaluate(js)
+    
+    
+    async def _get_author_avatar(self, art) -> str | None:
+        # 1) try the standard avatar container
+        img = await art.query_selector("div[data-testid='Tweet-User-Avatar'] img[src]")
+        if not img:
+            # 2) fallback: any img inside a link to the author
+            img = await art.query_selector(f'a[href="/{self.author_handle}"] img[src]')
+        if not img:
+            return None
+        src = await img.get_attribute("src")
+        if not src:
+            return None
+        # upgrade to higher-res if you want (Twitter suffixes: _normal, _bigger, _mini)
+        return re.sub(r'_(normal|bigger|mini)\.(jpg|png)$', r'_400x400.\2', src)
+
     
     async def _scroll_until_new(self, seen_ids: set[str], step: int = 1400, max_steps: int = 15) -> bool:
         """Smoothly scroll down in small steps until at least one unseen tweet appears,
@@ -280,7 +322,20 @@ class ThreadScraper:
         if raw:
             return raw.strip()
         return ""
-
+    
+        
+    async def _capture_video(self, resp: pw.Response) -> None:
+        url = resp.url
+        if "video.twimg.com" not in url:
+            return
+        if resp.status not in (200, 206):
+            return
+        ctype = await resp.header_value("content-type") or ""
+        if (".mp4" in url) or (".m3u8" in url) or "application/vnd.apple.mpegurl" in ctype or "video/mp4" in ctype:
+            m = re.search(r"(?:amplify_video|ext_tw_video)/(\d+)/", url)
+            if m:
+                self.video_pool[m.group(1)].append(url)
+                
 
     async def _media(self, art) -> Dict[str, Any]:
         images = [
@@ -288,19 +343,28 @@ class ThreadScraper:
             for img in await art.query_selector_all('img[src*="twimg.com/media"]')
         ]
 
-        videos_raw: List[str] = []
-        for vtag in await art.query_selector_all("div[data-testid='videoPlayer'] video, video"):
-            src = await vtag.get_attribute("src")
-            if not src:
-                src_el = await vtag.query_selector("source[src]")
-                if src_el:
-                    src = await src_el.get_attribute("src")
-            if src and "twimg.com" in src:
-                videos_raw.append(src)
-
+        # --- NEW: match videos via ids from DOM + pool ------------------------
         video_variants: List[Dict[str, Any]] = []
-        for url in videos_raw:
-            video_variants.extend(variant_from_mp4(url))  # your existing helper
+        vid_ids = await self._video_ids_in_art(art)
+
+        for vid_id in vid_ids:
+            if vid_id in self.assigned_video_ids:
+                continue
+            pool = self.video_pool.get(vid_id, [])
+            for u in pool:
+                video_variants.extend(variant_from_mp4(u))
+            if pool:
+                self.assigned_video_ids.add(vid_id)
+
+        # PERF fallback: if still empty, try resource timing
+        if not video_variants:
+            perf_urls = await self.page.evaluate("""
+                () => performance.getEntriesByType('resource')
+                    .map(e=>e.name)
+                    .filter(u => u.includes('video.twimg.com') && (u.includes('.mp4') || u.includes('.m3u8')))
+            """)
+            for u in perf_urls:
+                video_variants.extend(variant_from_mp4(u))
 
         media_obj: Dict[str, Any] = {}
         if images:
@@ -311,7 +375,7 @@ class ThreadScraper:
         return media_obj
 
 
-    async def _parse_tweet(self, art, author_handle: str) -> Optional[Dict[str, Any]]:
+    async def _parse_tweet(self, art) -> Optional[Dict[str, Any]]:
         """Return tweet dict if this article belongs to the author, else None."""
         permalink_el = await art.query_selector('a[href*="/status/"]')
         if not permalink_el:
@@ -323,7 +387,7 @@ class ThreadScraper:
         tweet_id = tid_match.group(1)
 
         handle = tweet_url.strip("/").split("/")[0]
-        if handle != author_handle:
+        if handle != self.author_handle:
             return None
 
         # timestamp
@@ -343,18 +407,17 @@ class ThreadScraper:
         )
 
         # display name
-        disp_el = await art.query_selector("div[data-testid='User-Name'] span") \
-                  or await art.query_selector("div[dir='auto'] span")
-        display_name = await disp_el.inner_text() if disp_el else ""
+        if self.author_name is None:
+            disp_el = await art.query_selector("div[data-testid='User-Name'] span") \
+                    or await art.query_selector("div[dir='auto'] span")
+            self.author_name = await disp_el.inner_text() if disp_el else ""
 
         media_obj = await self._media(art)
 
         return {
             "tweet_id": tweet_id,
             "datetime": date_time_iso,
-            "username": author_handle,
-            "display_name": display_name,
-            "text": text_content,
+            "tweet": text_content,
             "likes": likes,
             "retweets": retweets,
             "replies": replies,
@@ -373,13 +436,20 @@ class ThreadScraper:
         await self.page.wait_for_timeout(800)           # let initial JS run
         await self.page.mouse.wheel(0, 600)             # nudge to trigger first batch render
 
+
         # await self._load_entire_thread()
         tweets = await self._extract_tweets()
 
         return {
+            "thread_title": tweets[0]["tweet"] if tweets else "No tweets found",
             "thread_url": url,
             "tweet_count": len(tweets),
-            "tweets": tweets,
+            "author": {
+                "username": self.author_handle, 
+                "display_name": self.author_name,
+                "profile_image_url": self.author_avatar_url
+            },
+            "tweets": tweets[1:],
         }
 
 
@@ -387,7 +457,6 @@ class ThreadScraper:
         """Scroll-scrape the whole thread, grabbing every tweet by the author only."""
         tweets: List[Dict[str, Any]] = []
         seen_ids: set[str] = set()
-        author_handle: Optional[str] = None
 
         STALL_LIMIT = 3          # no new tweets found N times → stop
         TAIL_LIMIT = 1           # N non-author tweets in a row after we've started → stop
@@ -412,7 +481,7 @@ class ThreadScraper:
                 continue
             
             # determine author once
-            if author_handle is None:
+            if self.author_handle is None:
                 first_permalink = await articles[0].query_selector('a[href*="/status/"]')
                 if not first_permalink:
                     console.log("[bold red]Could not find a tweet permalink – layout change?")
@@ -422,12 +491,19 @@ class ThreadScraper:
                 if len(parts) < 2:
                     console.log("[bold red]Could not determine author handle.")
                     return tweets
-                author_handle = parts[0]
-                print(f"Author handle: {author_handle}")
+                self.author_handle = parts[0]
+                self.author_avatar_url = await self._get_author_avatar(articles[0])
+                print(f"Author handle: @{self.author_handle}")
 
             new_this_pass = 0
             for art in articles:
                 await self._scroll_into_view(art)
+                await self.page.evaluate("""
+                (el)=>{
+                    const v = el.querySelector('video');
+                    if (v) { v.muted = true; v.play().catch(()=>{}); }
+                }
+                """, art)
 
                 # get tweet id quickly to skip duplicates / decide author streak
                 permalink_el = await art.query_selector('a[href*="/status/"]')
@@ -442,23 +518,24 @@ class ThreadScraper:
                     continue
 
                 handle = tweet_url.strip("/").split("/")[0]
-                if handle != author_handle:
+                if handle != self.author_handle:
                     after_thread_tail += 1
                     if tweets and after_thread_tail >= TAIL_LIMIT:
                         # we already collected author tweets and now saw enough non-author ones
-                        return tweets
+                        return tweets 
                     continue
                 else:
                     after_thread_tail = 0
 
-                tweet_obj = await self._parse_tweet(art, author_handle)
+                tweet_obj = await self._parse_tweet(art)
                 if tweet_obj:
+                    # print(">>>>>>>>>", tweet_obj)
                     tweets.append(tweet_obj)
                     seen_ids.add(tweet_id)
                     new_this_pass += 1
                     tweet_counter += 1
-                    tweet_txt = f"{tweet_obj['text'][:50]}..." if len(tweet_obj['text']) >= 50 else f"{tweet_obj['text']}"
-                    print(f"Collected tweet #{tweet_counter}: {tweet_id} by {author_handle}: {tweet_txt}")
+                    tweet_txt = f"{tweet_obj['tweet'][:50]}..." if len(tweet_obj['tweet']) >= 50 else f"{tweet_obj['tweet']}"
+                    print(f"Collected tweet #{tweet_counter} ({tweet_id}) by {self.author_name} (@{self.author_handle}): {tweet_txt}")
                 
             # scroll for more (incremental, avoid skipping)
             if new_this_pass == 0:
@@ -523,6 +600,7 @@ async def main(argv: List[str] | None = None) -> None:
             "--disable-blink-features=AutomationControlled",
             "--disable-dev-shm-usage",
             "--no-sandbox",
+            "--autoplay-policy=no-user-gesture-required",
         ],
         proxy={"server": args.proxy} if args.proxy else None
     )
