@@ -73,8 +73,11 @@ TWEET_ARTICLE = "article[role=\"article\"]"
 TWEET_URL_RE = re.compile(r"/status/(\d+)")
 AUTHOR_RE = re.compile(r"^/@?([\w\d_]+)$")
 
-X_AUTH_TOKEN = os.getenv("X_AUTH_TOKEN")
-HEADLESS = False
+HEADLESS = True
+X_AUTH_TOKEN = os.getenv("X_AUTH_TOKEN")                                            # 'auth_token' cookie from a logged-in twitter session
+TIMEZONE_ID = os.getenv("TIMEZONE_ID")                                              # change to your local timezone
+EXTRACT_MP4_ONLY = os.getenv("EXTRACT_MP4_ONLY", "False").lower() == "true"         # set to True to use a persistent Firefox profile
+
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
 
@@ -665,26 +668,44 @@ async def main(argv: List[str] | None = None) -> None:
         sys.exit(1)
 
     playwright = await pw.async_playwright().start()
-    browser = await playwright.firefox.launch(
-        headless=HEADLESS,
-        args=[
-            "--no-sandbox",
-            "--disable-setuid-sandbox"
-        ]
-    )
-
-    context = await browser.new_context(
-        user_agent=UA,
-        viewport={"width": 1366, "height": 900},
-        device_scale_factor=1,
-        locale="en-US",
-        timezone_id="Asia/Kolkata",
-        java_script_enabled=True,
-    )
+    
+    if EXTRACT_MP4_ONLY:
+        browser = await playwright.firefox.launch_persistent_context(
+            user_data_dir="profile",
+            headless=HEADLESS,
+            user_agent=UA,
+            viewport={"width": 1366, "height": 900},
+            device_scale_factor=1,
+            locale="en-US",
+            timezone_id=TIMEZONE_ID,
+            java_script_enabled=True,
+            firefox_user_prefs={"media.mediasource.enabled": False},
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox"
+            ]
+        )
+    else:
+        browser_init = await playwright.firefox.launch(
+            headless=HEADLESS,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox"
+            ]
+        )
+        
+        browser = await browser_init.new_context(
+            user_agent=UA,
+            viewport={"width": 1366, "height": 900},
+            device_scale_factor=1,
+            locale="en-US",
+            timezone_id=TIMEZONE_ID,
+            java_script_enabled=True,
+        )
 
 
     # stealth: kill webdriver flag
-    await context.add_init_script(
+    await browser.add_init_script(
         "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
     )
 
@@ -693,9 +714,8 @@ async def main(argv: List[str] | None = None) -> None:
         {"name": "auth_token", "value": X_AUTH_TOKEN, "domain": ".x.com", "path": "/", "httpOnly": True, "secure": True},
     ]
     
-    await context.add_cookies(cookies)
-
-    page = await context.new_page()
+    await browser.add_cookies(cookies)
+    page = await browser.new_page()
     scraper = ThreadScraper(page, proxy=args.proxy)
 
     results: List[Dict[str, Any]] = []
