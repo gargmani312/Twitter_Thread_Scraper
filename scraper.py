@@ -139,6 +139,8 @@ class ThreadScraper:
         self.scroll_pause = scroll_pause
         self.proxy = proxy
         self.show_more_replies = False
+        self.tweet_id = None
+        self.quoted_tweet = {}
         self.video_pool: dict[str, list[str]] = defaultdict(list)   # video_id -> [urls]
         self.assigned_video_ids: set[str] = set()                   # avoid double-assign
         self.page.context.on("response", self._capture_video)
@@ -146,6 +148,31 @@ class ThreadScraper:
 
     async def _capture_video(self, resp: pw.Response) -> None:
         url = resp.url
+
+        if "https://x.com/i/api/graphql/" in url:
+            try:
+                data = await resp.json()
+                legacy = (
+                    data.get("data", {})
+                        .get("threaded_conversation_with_injections_v2", {})
+                        .get("instructions", [])[1]                    # the second instruction (the one with entries)
+                        .get("entries", [])[0]                         # first entry
+                        .get("content", {})
+                        .get("itemContent", {})
+                        .get("tweet_results", {})
+                        .get("result", {})
+                        .get("legacy", {})
+                )
+
+                id_str = legacy.get("id_str")
+                is_quote_status = legacy.get("is_quote_status")
+                expanded_url = legacy.get("quoted_status_permalink", {}).get("expanded")
+                
+                if is_quote_status and expanded_url:
+                    self.quoted_tweet[id_str] = expanded_url
+            except Exception:
+                return      
+            
         if "video.twimg.com" not in url:
             return
         if resp.status not in (200, 206):
@@ -453,11 +480,13 @@ class ThreadScraper:
         )
 
         media_obj = await self._media(art)
+        quoted_tweet = self.quoted_tweet.get(self.tweet_id) if self.quoted_tweet != {} else {}
 
         return {
             "tweet_id": tweet_id,
             "datetime": date_time_iso,
             "tweet": text_content,
+            "quoted_tweet": quoted_tweet,
             "likes": likes,
             "retweets": retweets,
             "replies": replies,
@@ -475,7 +504,6 @@ class ThreadScraper:
         await self.page.wait_for_load_state("domcontentloaded")
         await self.page.wait_for_timeout(800)           # let initial JS run
         await self.page.mouse.wheel(0, 600)             # nudge to trigger first batch render
-
 
         # await self._load_entire_thread()
         tweets = await self._extract_tweets()
@@ -547,8 +575,8 @@ class ThreadScraper:
                 tid_match = TWEET_URL_RE.search(tweet_url)
                 if not tid_match:
                     continue
-                tweet_id = tid_match.group(1)
-                if tweet_id in seen_ids:
+                self.tweet_id = tid_match.group(1)
+                if self.tweet_id in seen_ids:
                     continue
                 
                 await self._scroll_into_view(art)
@@ -574,15 +602,15 @@ class ThreadScraper:
                 if tweet_obj and extracting_tweets:
                     idx = len(tweets)
                     tweets.append(tweet_obj)
-                    seen_ids.add(tweet_id)
+                    seen_ids.add(self.tweet_id)
                     new_this_pass += 1
                     tweet_counter += 1
                     tweet_txt = f"{tweet_obj['tweet'][:50]}..." if len(tweet_obj['tweet']) >= 50 else f"{tweet_obj['tweet']}"
-                    print(f"Collected tweet #{tweet_counter} ({tweet_id}) by {self.author_name} (@{self.author_handle}): {tweet_txt}")
+                    print(f"Collected tweet #{tweet_counter} ({self.tweet_id}) by {self.author_name} (@{self.author_handle}): {tweet_txt}")
 
                     # track tweets with empty media for a second pass
                     if not tweet_obj.get("media"):
-                        pending_media.append((tweet_id, idx))
+                        pending_media.append((self.tweet_id, idx))
                 
             # scroll for more (incremental, avoid skipping)
             if new_this_pass == 0:
@@ -707,7 +735,7 @@ async def main(argv: List[str] | None = None) -> None:
 
     for i, url in enumerate(args.urls, 1):
         try:
-            print(f"[{i}/{len(args.urls)}] Scraping {url}…")
+            print(f"[{i}/{len(args.urls)}] Scraping url... {url}")
             scraper.url = url
             res = await scraper.scrape(url)
             results.append(res)
