@@ -132,6 +132,7 @@ class ThreadScraper:
         scroll_pause: float = 0.6,
     ) -> None:
         self.page = page
+        self.url = None
         self.author_name = None
         self.author_handle = None
         self.author_avatar_url = None
@@ -433,21 +434,8 @@ class ThreadScraper:
                 pending_ids.discard(tid)
 
 
-    async def _parse_tweet(self, art) -> Optional[Dict[str, Any]]:
+    async def _parse_tweet(self, art, tweet_id) -> Optional[Dict[str, Any]]:
         """Return tweet dict if this article belongs to the author, else None."""
-        permalink_el = await art.query_selector('a[href*="/status/"]')
-        if not permalink_el:
-            return None
-        tweet_url = await permalink_el.get_attribute("href") or ""
-        tid_match = TWEET_URL_RE.search(tweet_url)
-        if not tid_match:
-            return None
-        tweet_id = tid_match.group(1)
-
-        handle = tweet_url.strip("/").split("/")[0]
-        if handle != self.author_handle:
-            return None
-
         # timestamp
         time_el = await art.query_selector("time")
         date_time_iso = await time_el.get_attribute("datetime") if time_el else None
@@ -535,18 +523,14 @@ class ThreadScraper:
             
             # determine author once
             if self.author_handle is None:
-                first_permalink = await articles[0].query_selector('a[href*="/status/"]')
-                if not first_permalink:
-                    console.log("[bold red]Could not find a tweet permalink – layout change?")
-                    return tweets
-                first_href = (await first_permalink.get_attribute("href") or "").strip("/")
-                parts = first_href.split("/")
-                if len(parts) < 2:
+                pattern = r"https?://x\.com/([^/]+)/status"
+                match = re.search(pattern, self.url)
+                self.author_handle = match.group(1)
+                if not self.author_handle:
                     console.log("[bold red]Could not determine author handle.")
                     return tweets
 
                 # Author Info
-                self.author_handle = parts[0]
                 self.author_avatar_url = await self._get_author_avatar(articles[0])
                 disp_el = await self.page.query_selector("div[data-testid='User-Name'] span") \
                         or await self.page.query_selector("div[dir='auto'] span")
@@ -556,7 +540,7 @@ class ThreadScraper:
             new_this_pass = 0
             for art in articles:
                 # get tweet id quickly to skip duplicates / decide author streak
-                permalink_el = await art.query_selector('a[href*="/status/"]')
+                permalink_el = await art.query_selector('a:has(time)')
                 if not permalink_el:
                     continue
                 tweet_url = await permalink_el.get_attribute("href") or ""
@@ -575,7 +559,7 @@ class ThreadScraper:
                 }
                 """, art)
 
-                handle = tweet_url.strip("/").split("/")[0]
+                handle = tweet_url.replace("/", " ").strip(" ").split(" ")[0]
                 if handle != self.author_handle:
                     after_thread_tail += 1
                     if tweets and after_thread_tail >= TAIL_LIMIT:
@@ -585,7 +569,8 @@ class ThreadScraper:
                 else:
                     after_thread_tail = 0
 
-                tweet_obj = await self._parse_tweet(art)
+                await self.page.wait_for_timeout(1000)
+                tweet_obj = await self._parse_tweet(art, tweet_url)
                 if tweet_obj and extracting_tweets:
                     idx = len(tweets)
                     tweets.append(tweet_obj)
@@ -621,7 +606,7 @@ class ThreadScraper:
                 if not art:
                     continue
                 # await self._scroll_into_view(art)
-                fixed = await self._parse_tweet(art)
+                fixed = await self._parse_tweet(art, tid)
                 if fixed and fixed.get("media"):
                     tweets[idx]["media"] = fixed["media"]
 
@@ -723,6 +708,7 @@ async def main(argv: List[str] | None = None) -> None:
     for i, url in enumerate(args.urls, 1):
         try:
             print(f"[{i}/{len(args.urls)}] Scraping {url}…")
+            scraper.url = url
             res = await scraper.scrape(url)
             results.append(res)
         except Exception as e:
